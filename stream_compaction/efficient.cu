@@ -15,6 +15,7 @@ namespace StreamCompaction {
         namespace {
 
             const int BLOCK_SIZE = 64;
+            const int FUSED_BLOCK_SIZE = 1024;
 
             int nextPow2(int n) {
                 int m = 1;
@@ -26,11 +27,7 @@ namespace StreamCompaction {
 
         }  // namespace
 
-        /**
-         * Up-sweep phase of the Blelloch scan: builds the inclusive-scan tree.
-         * offset is the distance between the pair of tree nodes merged at this
-         * level (1, 2, 4, ...).
-         */
+        // Up-sweep phase of the Blelloch scan
         __global__ void kernEfficientUpSweep(int m, int offset, int *data) {
             int index = blockIdx.x * blockDim.x + threadIdx.x;
             int active = m / (2 * offset);
@@ -42,10 +39,7 @@ namespace StreamCompaction {
             }
         }
 
-        /**
-         * Down-sweep phase of the Blelloch scan: turns the inclusive tree into
-         * an exclusive prefix sum. offset halves each level (m/2, m/4, ...).
-         */
+        // Down-sweep phase
         __global__ void kernEfficientDownSweep(int m, int offset, int *data) {
             int index = blockIdx.x * blockDim.x + threadIdx.x;
             int active = m / (2 * offset);
@@ -64,16 +58,39 @@ namespace StreamCompaction {
                 data[m - 1] = 0;
             }
         }
+        // The levels whose active merge count is at most FUSED_BLOCK_SIZE are
+        // fused into a single 1024-thread block: several tree levels are walked
+        // with __syncthreads() between them instead of paying one kernel launch
+        // per level (Part 5).
+        __global__ void kernEfficientUpSweepFused(int m, int firstOffset, int *data) {
+            for (int offset = firstOffset; offset < m; offset <<= 1) {
+                int active = m / (2 * offset);
+                if (threadIdx.x < active) {
+                    int idx = (threadIdx.x + 1) * (2 * offset) - 1;
+                    data[idx] += data[idx - offset];
+                }
+                __syncthreads();
+            }
+        }
 
-        /**
-         * Runs the work-efficient exclusive scan in place on a device array of
-         * length m, where m is a power of two. Values in the array are the
-         * "input"; padded slots beyond the logical length must already be 0.
-         *
-         * This helper intentionally does not touch the timer: compact() reuses
-         * it while its own GPU timer is already running.
-         */
-        static void scanDevice(int m, int *data) {
+        __global__ void kernEfficientDownSweepFused(int m, int lastOffset, int *data) {
+            for (int offset = m / 2; offset >= lastOffset; offset >>= 1) {
+                int active = m / (2 * offset);
+                if (threadIdx.x < active) {
+                    int node0 = (2 * threadIdx.x + 1) * offset - 1;
+                    int node1 = node0 + offset;
+                    data[node1] += data[node0];
+                    data[node0] = data[node1] - data[node0];
+                }
+                __syncthreads();
+            }
+        }
+
+        // Runs the work-efficient exclusive scan in place on a device array.
+        // m must be a power of two and every element past the logical length
+        // must already be zero. Exposed so that GPU modules built on top of the
+        // scan (see radix_sort.cu) can chain scans without a host round trip.
+        void scanDevice(int m, int *data) {
             if (m <= 0) {
                 return;
             }
@@ -82,24 +99,33 @@ namespace StreamCompaction {
                 return;
             }
 
-            for (int offset = 1; offset < m; offset <<= 1) {
+            // Top levels (active merges <= FUSED_BLOCK_SIZE) run in one block.
+            // For m = 2^22 this turns 11 launches per phase into one; below
+            // m = 2048 the whole scan fits into three launches.
+            const int fusedFirst = (m > 2 * FUSED_BLOCK_SIZE) ? (m / (2 * FUSED_BLOCK_SIZE)) : 1;
+
+            for (int offset = 1; offset < fusedFirst; offset <<= 1) {
                 int active = m / (2 * offset);
                 int blocks = (active + BLOCK_SIZE - 1) / BLOCK_SIZE;
                 kernEfficientUpSweep<<<blocks, BLOCK_SIZE>>>(m, offset, data);
             }
+            if (fusedFirst < m) {
+                kernEfficientUpSweepFused<<<1, FUSED_BLOCK_SIZE>>>(m, fusedFirst, data);
+            }
 
             kernEfficientSetLastZero<<<1, 1>>>(m, data);
 
-            for (int offset = m / 2; offset > 0; offset >>= 1) {
+            if (fusedFirst <= m / 2) {
+                kernEfficientDownSweepFused<<<1, FUSED_BLOCK_SIZE>>>(m, fusedFirst, data);
+            }
+            for (int offset = fusedFirst >> 1; offset > 0; offset >>= 1) {
                 int active = m / (2 * offset);
                 int blocks = (active + BLOCK_SIZE - 1) / BLOCK_SIZE;
                 kernEfficientDownSweep<<<blocks, BLOCK_SIZE>>>(m, offset, data);
             }
         }
 
-        /**
-         * Performs prefix-sum (aka scan) on idata, storing the result into odata.
-         */
+        // Performs prefix-sum on idata, storing the result into odata
         void scan(int n, int *odata, const int *idata) {
             if (n <= 0) {
                 return;
@@ -113,23 +139,18 @@ namespace StreamCompaction {
                 cudaMemset(devData + n, 0, (m - n) * sizeof(int));
             }
 
+            checkCUDAError("Efficient::scan: cudaMalloc / cudaMemcpy / cudaMemset failed");
             timer().startGpuTimer();
             scanDevice(m, devData);
             timer().endGpuTimer();
+            checkCUDAError("Efficient::scan: kernel execution failed");
 
             cudaMemcpy(odata, devData, n * sizeof(int), cudaMemcpyDeviceToHost);
+            checkCUDAError("Efficient::scan: cudaMemcpy(D2H) failed");
             cudaFree(devData);
         }
 
-        /**
-         * Performs stream compaction on idata, storing the result into odata.
-         * All zeroes are discarded.
-         *
-         * @param n      The number of elements in idata.
-         * @param odata  The array into which to store elements.
-         * @param idata  The array of elements to compact.
-         * @returns      The number of elements remaining after compaction.
-         */
+        // Performs stream compaction on idata, storing the result into odata
         int compact(int n, int *odata, const int *idata) {
             if (n <= 0) {
                 return 0;
@@ -153,10 +174,10 @@ namespace StreamCompaction {
                 cudaMemset(devIndices + n, 0, (m - n) * sizeof(int));
             }
 
+            checkCUDAError("Efficient::compact: cudaMalloc / cudaMemcpy / cudaMemset failed");
             timer().startGpuTimer();
 
-            // Map 1/0 keep/remove values into two buffers: one stays as the
-            // scatter predicate and the other is overwritten by the scan.
+            // Map 1/0 keep/remove values into two buffers
             Common::kernMapToBoolean<<<fullBlocks, blockSize>>>(n, devBools, devIData);
             Common::kernMapToBoolean<<<fullBlocks, blockSize>>>(n, devIndices, devIData);
 
@@ -166,11 +187,13 @@ namespace StreamCompaction {
                 n, devOdata, devIData, devBools, devIndices);
 
             timer().endGpuTimer();
+            checkCUDAError("Efficient::compact: kernel execution failed");
 
             int lastIndex = 0;
             cudaMemcpy(&lastIndex, devIndices + n - 1, sizeof(int), cudaMemcpyDeviceToHost);
             int count = lastIndex + ((idata[n - 1] != 0) ? 1 : 0);
             cudaMemcpy(odata, devOdata, count * sizeof(int), cudaMemcpyDeviceToHost);
+            checkCUDAError("Efficient::compact: cudaMemcpy(D2H) failed");
 
             cudaFree(devIData);
             cudaFree(devBools);

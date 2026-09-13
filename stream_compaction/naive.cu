@@ -12,10 +12,7 @@ namespace StreamCompaction {
             return timer;
         }
 
-        /**
-         * One doubling step of the naive (Hillis-Steele) inclusive scan.
-         * Reads from `in` and writes the next iteration into `out`.
-         */
+        // Ping-pong
         __global__ void kernNaiveScanStep(int n, int offset, int *out, const int *in) {
             int index = blockIdx.x * blockDim.x + threadIdx.x;
             if (index < n) {
@@ -23,10 +20,7 @@ namespace StreamCompaction {
             }
         }
 
-        /**
-         * Converts an inclusive prefix sum into an exclusive one:
-         * out[0] = 0, out[i] = in[i - 1].
-         */
+        // Converts an inclusive prefix sum into an exclusive one
         __global__ void kernExclusiveShift(int n, int *out, const int *in) {
             int index = blockIdx.x * blockDim.x + threadIdx.x;
             if (index == 0) {
@@ -36,9 +30,7 @@ namespace StreamCompaction {
             }
         }
 
-        /**
-         * Performs prefix-sum (aka scan) on idata, storing the result into odata.
-         */
+        // Performs prefix sum on idata, storing the result into odata
         void scan(int n, int *odata, const int *idata) {
             if (n <= 0) {
                 return;
@@ -54,11 +46,11 @@ namespace StreamCompaction {
             cudaMalloc(reinterpret_cast<void **>(&devB), n * sizeof(int));
             cudaMalloc(reinterpret_cast<void **>(&devOut), n * sizeof(int));
             cudaMemcpy(devA, idata, n * sizeof(int), cudaMemcpyHostToDevice);
+            checkCUDAError("Naive::scan: cudaMalloc / cudaMemcpy(H2D) failed");
 
             timer().startGpuTimer();
 
-            // Double-buffered naive inclusive scan.  Each iteration doubles
-            // the span of elements folded into each output position.
+            // Double-buffered naive inclusive scan
             int *src = devA;
             int *dst = devB;
             for (int offset = 1; offset < n; offset <<= 1) {
@@ -68,12 +60,14 @@ namespace StreamCompaction {
                 dst = tmp;
             }
 
-            // Shift the inclusive result by one to produce the exclusive scan.
+            // Shift to produce the exclusive scan
             kernExclusiveShift<<<fullBlocks, blockSize>>>(n, devOut, src);
 
             timer().endGpuTimer();
+            checkCUDAError("Naive::scan: kernel execution failed");
 
             cudaMemcpy(odata, devOut, n * sizeof(int), cudaMemcpyDeviceToHost);
+            checkCUDAError("Naive::scan: cudaMemcpy(D2H) failed");
             cudaFree(devA);
             cudaFree(devB);
             cudaFree(devOut);

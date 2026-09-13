@@ -12,11 +12,7 @@ namespace StreamCompaction {
             return timer;
         }
 
-        /**
-         * CPU scan (prefix sum).
-         * For performance analysis, this is supposed to be a simple for loop.
-         * (Optional) For better understanding before starting moving to GPU, you can simulate your GPU scan in this function first.
-         */
+		// CPU scan 
         void scan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
             int running = 0;
@@ -27,11 +23,7 @@ namespace StreamCompaction {
             timer().endCpuTimer();
         }
 
-        /**
-         * CPU stream compaction without using the scan function.
-         *
-         * @returns the number of elements remaining after compaction.
-         */
+        // CPU stream compaction without using the scan function
         int compactWithoutScan(int n, int *odata, const int *idata) {
             timer().startCpuTimer();
             int count = 0;
@@ -44,11 +36,7 @@ namespace StreamCompaction {
             return count;
         }
 
-        /**
-         * CPU stream compaction using scan and scatter, like the parallel version.
-         *
-         * @returns the number of elements remaining after compaction.
-         */
+        // CPU stream compaction using scan and scatter
         int compactWithScan(int n, int *odata, const int *idata) {
             if (n <= 0) {
                 return 0;
@@ -59,13 +47,12 @@ namespace StreamCompaction {
 
             timer().startCpuTimer();
 
-            // Map: 1 for elements to keep, 0 for elements to remove.
+            // Map
             for (int i = 0; i < n; ++i) {
                 bools[i] = (idata[i] != 0) ? 1 : 0;
             }
 
-            // Scan: exclusive prefix sum of the mapped array gives each
-            // surviving element its destination index.
+            // Scan
             int running = 0;
             for (int i = 0; i < n; ++i) {
                 indices[i] = running;
@@ -74,7 +61,7 @@ namespace StreamCompaction {
 
             int count = indices[n - 1] + bools[n - 1];
 
-            // Scatter: place each surviving element at its scanned index.
+            // Scatter
             for (int i = 0; i < n; ++i) {
                 if (bools[i]) {
                     odata[indices[i]] = idata[i];

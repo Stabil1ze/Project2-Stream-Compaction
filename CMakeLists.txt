@@ -42,3 +42,21 @@ source_group(Sources FILES ${sources})
 add_executable(${CMAKE_PROJECT_NAME} ${sources} ${headers})
 target_link_libraries(${CMAKE_PROJECT_NAME} stream_compaction)
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT ${CMAKE_PROJECT_NAME})
+
+# Part 5 benchmark harness (reproducible measurements for the write-up)
+add_executable(stream_compaction_bench
+    "src/bench.cu"
+    )
+
+# Mirror the architecture selection of the stream_compaction library (see
+# stream_compaction/CMakeLists.txt): `native` needs CMake >= 3.24.
+if(CMAKE_VERSION VERSION_LESS 3.23.0)
+    set(BENCH_CUDA_ARCHITECTURES OFF)
+elseif(CMAKE_VERSION VERSION_LESS 3.24.0)
+    set(BENCH_CUDA_ARCHITECTURES all-major)
+else()
+    set(BENCH_CUDA_ARCHITECTURES native)
+endif()
+set_target_properties(stream_compaction_bench PROPERTIES CUDA_ARCHITECTURES ${BENCH_CUDA_ARCHITECTURES})
+target_link_libraries(stream_compaction_bench stream_compaction)
+target_compile_options(stream_compaction_bench PRIVATE "$<$<AND:$<COMPILE_LANGUAGE:CUDA>,$<PLATFORM_ID:Windows>>:-Xcompiler=/Zc:preprocessor>")
