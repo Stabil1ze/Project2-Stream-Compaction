@@ -4,6 +4,7 @@ set(headers
     "naive.h"
     "efficient.h"
     "radix_sort.h"
+    "shared_scan.h"
     "thrust.h"
     )
 
@@ -13,6 +14,7 @@ set(sources
     "naive.cu"
     "efficient.cu"
     "radix_sort.cu"
+    "shared_scan.cu"
     "thrust.cu"
     )
 

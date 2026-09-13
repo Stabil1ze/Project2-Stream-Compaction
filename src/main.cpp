@@ -13,6 +13,7 @@
 #include <stream_compaction/naive.h>
 #include <stream_compaction/efficient.h>
 #include <stream_compaction/radix_sort.h>
+#include <stream_compaction/shared_scan.h>
 #include <stream_compaction/thrust.h>
 #include "testing_helpers.hpp"
 
@@ -42,6 +43,40 @@ void testRadixSort(const char *desc, int n, const int *input, bool printValues) 
     if (printValues) {
         printArray(n, actual, true);
     }
+    printCmpResult(n, expected, actual);
+
+    delete[] expected;
+    delete[] actual;
+}
+
+/**
+ * Extra credit 2 helper: checks the three shared-memory scans (Example 39-1,
+ * Example 39-2 and the bank-conflict-free variant of 39-2) against the CPU
+ * reference for one input.
+ */
+void testSharedScan(const char *desc, int n, const int *input) {
+    int *expected = new int[n];
+    int *actual = new int[n];
+
+    StreamCompaction::CPU::scan(n, expected, input);
+    printDesc(desc);
+
+    zeroArray(n, actual);
+    StreamCompaction::SharedScan::scanNaive(n, actual, input);
+    printElapsedTime(StreamCompaction::SharedScan::timer().getGpuElapsedTimeForPreviousOperation(),
+                     "(CUDA Measured) Example 39-1, Hillis-Steele in shared memory");
+    printCmpResult(n, expected, actual);
+
+    zeroArray(n, actual);
+    StreamCompaction::SharedScan::scanEfficient(n, actual, input);
+    printElapsedTime(StreamCompaction::SharedScan::timer().getGpuElapsedTimeForPreviousOperation(),
+                     "(CUDA Measured) Example 39-2, tree in shared memory");
+    printCmpResult(n, expected, actual);
+
+    zeroArray(n, actual);
+    StreamCompaction::SharedScan::scanEfficientPadded(n, actual, input);
+    printElapsedTime(StreamCompaction::SharedScan::timer().getGpuElapsedTimeForPreviousOperation(),
+                     "(CUDA Measured) Example 39-2, padded shared layout");
     printCmpResult(n, expected, actual);
 
     delete[] expected;
@@ -281,6 +316,59 @@ int main(int argc, char* argv[]) {
         testRadixSort("gpu radix sort, 2^20 random 32-bit values", n, bigInput, false);
         delete[] bigInput;
     }
+
+    printf("\n");
+    printf("*******************************\n");
+    printf("** SHARED MEMORY SCAN TESTS **\n");
+    printf("*******************************\n");
+
+    // Extra credit 2: every case below checks the three shared-memory scans
+    // (Example 39-1, Example 39-2, and the padded layout) against the CPU scan.
+    genArray(SIZE - 1, a, 50);
+    a[SIZE - 1] = 0;
+    printArray(SIZE, a, true);
+    testSharedScan("shared-memory scan, power-of-two (256)", SIZE, a);
+    testSharedScan("shared-memory scan, non-power-of-two (253)", NPOT, a);
+
+    {
+        // 33 elements: a single partial tile, so the shared-memory padding of the
+        // tile is exercised without a second block.
+        const int n = 33;
+        int *input = new int[n];
+        for (int i = 0; i < n; ++i) {
+            input[i] = i + 1;
+        }
+        testSharedScan("shared-memory scan, 33 elements (single partial tile)", n, input);
+        delete[] input;
+    }
+
+    {
+        // 10000 elements: 40 tiles of 256, the last one partial, plus a tile-sum
+        // array that is not a power of two.
+        const int n = 10000;
+        int *input = new int[n];
+        for (int i = 0; i < n; ++i) {
+            input[i] = (int)(rand() % 50);
+        }
+        testSharedScan("shared-memory scan, 10000 elements (last tile partial)", n, input);
+        delete[] input;
+    }
+
+    {
+        const int single[1] = { 7 };
+        testSharedScan("shared-memory scan, single element", 1, single);
+    }
+
+    {
+        const int n = 1 << 20;
+        int *input = new int[n];
+        for (int i = 0; i < n; ++i) {
+            input[i] = (int)(rand() % 50);
+        }
+        testSharedScan("shared-memory scan, 2^20 elements", n, input);
+        delete[] input;
+    }
+
     system("pause"); // stop Win32 console from closing on exit
     delete[] a;
     delete[] b;

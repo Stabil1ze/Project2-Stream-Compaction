@@ -95,7 +95,10 @@ namespace StreamCompaction {
                 return;
             }
             if (m == 1) {
-                data[0] = 0;
+                // The one-element exclusive scan is a zero, but data lives in
+                // device memory: writing it from the host would fault, so the
+                // existing "zero the last element" kernel does it instead.
+                kernEfficientSetLastZero<<<1, 1>>>(m, data);
                 return;
             }
 

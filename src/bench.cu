@@ -34,6 +34,7 @@
 #include <stream_compaction/efficient.h>
 #include <stream_compaction/naive.h>
 #include <stream_compaction/radix_sort.h>
+#include <stream_compaction/shared_scan.h>
 #include <stream_compaction/thrust.h>
 
 namespace {
@@ -187,6 +188,7 @@ struct Options {
     int reps;
     bool csv;
     bool sortMode;
+    bool smemMode;
 };
 
 void fillRandom(std::vector<int> &data, unsigned int seed) {
@@ -365,6 +367,169 @@ void runSortBenchmark(const Options &opt, const cudaDeviceProp &prop) {
                (okRadix && okThrust) ? "ok" : "VERIFY FAIL");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Extra credit 2: shared-memory scan (GPU Gems 39). Variant 0 = Example 39-1,
+// 1 = Example 39-2 with the chapter's shared layout, 2 = Example 39-2 padded.
+// ---------------------------------------------------------------------------
+std::vector<float> timeSharedScan(int n, const std::vector<int> &input,
+                                  std::vector<int> &scratch, int total, int variant,
+                                  int blockThreads) {
+    std::vector<float> samples;
+    samples.reserve(total);
+    for (int k = 0; k < total; ++k) {
+        switch (variant) {
+            case 0:
+                StreamCompaction::SharedScan::scanNaive(n, scratch.data(), input.data(), blockThreads);
+                break;
+            case 1:
+                StreamCompaction::SharedScan::scanEfficient(n, scratch.data(), input.data(), blockThreads);
+                break;
+            default:
+                StreamCompaction::SharedScan::scanEfficientPadded(n, scratch.data(), input.data(), blockThreads);
+                break;
+        }
+        samples.push_back(
+            StreamCompaction::SharedScan::timer().getGpuElapsedTimeForPreviousOperation());
+    }
+    return samples;
+}
+
+// Repeats the shared-memory access pattern of the tree scan, so that the cost of
+// the bank conflicts is visible even though the real scan is dominated by other
+// work. PADDED selects between the chapter's layout and the padded one.
+template<bool PADDED>
+__global__ void kernBankConflictProbe(int repetitions, int *out) {
+    extern __shared__ int temp[];
+    const int t = threadIdx.x;
+    const int b = blockDim.x;
+    const int pad = PADDED ? 1 : 0;
+
+    for (int i = t; i < b; i += b) {
+        temp[i + (i >> 5) * pad] = i + 1;
+    }
+    __syncthreads();
+
+    for (int r = 0; r < repetitions; ++r) {
+        for (int offset = 1; offset < b; offset <<= 1) {
+            if (t < b / (2 * offset)) {
+                const int node = (t + 1) * (2 * offset) - 1;
+                const int left = node - offset;
+                temp[node + (node >> 5) * pad] += temp[left + (left >> 5) * pad];
+            }
+            __syncthreads();
+        }
+    }
+
+    if (t == 0) {
+        out[blockIdx.x] = temp[0];
+    }
+}
+
+// Times the two shared-memory layouts of the tree pattern in isolation.
+void runBankConflictProbe() {
+    const int probes = 4096;
+    const int block = 256;
+    const int repetitions = 200;
+    const int paddedElements = block + ((block + 31) >> 5);
+    const size_t smemPadded = static_cast<size_t>(paddedElements) * sizeof(int);
+    const size_t smemPlain = static_cast<size_t>(block) * sizeof(int);
+
+    int *devOut = nullptr;
+    cudaMalloc(reinterpret_cast<void **>(&devOut), probes * sizeof(int));
+    checkCUDAError("bench: bank conflict probe cudaMalloc failed");
+
+    CudaTimer timer;
+    float times[2] = { 0.0f, 0.0f };
+    // 0 = chapter layout, 1 = padded layout
+    kernBankConflictProbe<false><<<probes, block, smemPlain>>>(repetitions, devOut);
+    timer.begin();
+    kernBankConflictProbe<false><<<probes, block, smemPlain>>>(repetitions, devOut);
+    times[0] = timer.endMs();
+    kernBankConflictProbe<true><<<probes, block, smemPadded>>>(repetitions, devOut);
+    timer.begin();
+    kernBankConflictProbe<true><<<probes, block, smemPadded>>>(repetitions, devOut);
+    times[1] = timer.endMs();
+    checkCUDAError("bench: bank conflict probe failed");
+
+    cudaFree(devOut);
+
+    printf("\nshared-memory access pattern in isolation (%d blocks, block %d, %d repeats)\n",
+           probes, block, repetitions);
+    printf("%-34s %12s %10s\n", "layout", "time (ms)", "relative");
+    printf("%-34s %12.4f %10s\n", "Example 39-2 (stride-2, conflicts)", times[0], "1.00x");
+    printf("%-34s %12.4f %10.2fx\n", "Example 39-2, one pad per 32 elements",
+           times[1], times[1] / times[0]);
+}
+
+void runSmemBenchmark(const Options &opt, const cudaDeviceProp &prop) {
+    printf("CIS 5650 Project 2 - shared-memory scan benchmark (extra credit 2)\n");
+    printf("GPU: %s (compute capability %d.%d)\n", prop.name, prop.major, prop.minor);
+    printf("samples per point: %d iters x %d repetitions, median, block size %d\n\n",
+           opt.iters, opt.reps, StreamCompaction::SharedScan::DEFAULT_BLOCK_THREADS);
+    printf("%-11s %10s %10s %10s %10s %10s %10s %10s\n",
+           "n", "CPU", "Eff(fused)", "Smem39-1", "Smem39-2", "39-2 pad", "Thrust", "check");
+
+    const int total = opt.iters * opt.reps;
+    bool ok = true;
+
+    for (int lg : opt.log2sizes) {
+        const int n = 1 << lg;
+        std::vector<int> input(n), reference(n), scratch(n, 0);
+        fillRandom(input, 0x9E3779B9u ^ static_cast<unsigned int>(lg));
+
+        StreamCompaction::CPU::scan(n, reference.data(), input.data());
+
+        // Correctness of every variant (this also warms the kernels up).
+        for (int variant = 0; variant < 3; ++variant) {
+            std::fill(scratch.begin(), scratch.end(), 0);
+            (void)timeSharedScan(n, input, scratch, 1, variant,
+                                 StreamCompaction::SharedScan::DEFAULT_BLOCK_THREADS);
+            const char *name = (variant == 0) ? "SharedScan39-1"
+                             : (variant == 1) ? "SharedScan39-2" : "SharedScan39-2padded";
+            ok = verify(name, n, reference, scratch) && ok;
+        }
+
+        StreamCompaction::Efficient::scan(n, scratch.data(), input.data());
+        ok = verify("Efficient", n, reference, scratch) && ok;
+
+        const int block = StreamCompaction::SharedScan::DEFAULT_BLOCK_THREADS;
+        const std::vector<float> cpu = timeCpu(n, input, scratch, total);
+        const std::vector<float> eff = timeEfficient(n, input, scratch, total);
+        const std::vector<float> naive = timeSharedScan(n, input, scratch, total, 0, block);
+        const std::vector<float> tree = timeSharedScan(n, input, scratch, total, 1, block);
+        const std::vector<float> padded = timeSharedScan(n, input, scratch, total, 2, block);
+        const std::vector<float> thrustSamples = timeThrust(n, input, scratch, total);
+
+        printf("%-11d %10.4f %10.4f %10.4f %10.4f %10.4f %10.4f    %s\n", n,
+               medianOf(cpu), medianOf(eff), medianOf(naive), medianOf(tree),
+               medianOf(padded), medianOf(thrustSamples), ok ? "ok" : "VERIFY FAIL");
+    }
+
+    // The tile lives in dynamic shared memory, so the block size decides both the
+    // tile size and the shared memory per block (and therefore the number of
+    // resident blocks per SM).
+    const int sweepLg = opt.log2sizes.back();
+    const int sweepN = 1 << sweepLg;
+    std::vector<int> input(sweepN), scratch(sweepN, 0);
+    fillRandom(input, 0x51ED2701u);
+    printf("\nblock-size sweep at n = %d (%d samples each)\n",
+           sweepN, opt.iters);
+    printf("%-8s %14s %14s %14s %12s\n", "block", "39-1 (ms)", "39-2 pad (ms)",
+           "shared bytes", "tiles");
+    const int sweepBlocks[] = { 128, 256, 512, 1024 };
+    for (int b : sweepBlocks) {
+        (void)timeSharedScan(sweepN, input, scratch, 1, 0, b);
+        (void)timeSharedScan(sweepN, input, scratch, 1, 2, b);
+        const std::vector<float> naive = timeSharedScan(sweepN, input, scratch, opt.iters, 0, b);
+        const std::vector<float> padded = timeSharedScan(sweepN, input, scratch, opt.iters, 2, b);
+        const int paddedElements = b + ((b + 31) >> 5);
+        printf("%-8d %14.4f %14.4f %14d %12d\n", b, medianOf(naive), medianOf(padded),
+               paddedElements * static_cast<int>(sizeof(int)), (sweepN + b - 1) / b);
+    }
+
+    runBankConflictProbe();
+}
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -374,6 +539,7 @@ int main(int argc, char **argv) {
     opt.reps = 3;
     opt.csv = false;
     opt.sortMode = false;
+    opt.smemMode = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -381,6 +547,8 @@ int main(int argc, char **argv) {
             opt.csv = true;
         } else if (arg == "--sort") {
             opt.sortMode = true;
+        } else if (arg == "--smem") {
+            opt.smemMode = true;
         } else if (arg == "--iters" && i + 1 < argc) {
             opt.iters = std::atoi(argv[++i]);
         } else if (arg == "--reps" && i + 1 < argc) {
@@ -404,6 +572,11 @@ int main(int argc, char **argv) {
 
     if (opt.sortMode) {
         runSortBenchmark(opt, prop);
+        return 0;
+    }
+
+    if (opt.smemMode) {
+        runSmemBenchmark(opt, prop);
         return 0;
     }
 
