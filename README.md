@@ -10,61 +10,34 @@ Project 2 - Stream Compaction**
 
 ## Overview
 
-This project implements several versions of the **scan** (exclusive prefix sum)
-algorithm together with **stream compaction** that removes all `0`s from an
-array of `int`s. The same building blocks (scan + scatter) will later be used
-in the path tracer to compact away terminated rays.
+**Scan** (exclusive prefix sum) and **stream compaction** (remove every `0` from
+an `int` array) - the two building blocks the path tracer uses to drop terminated
+rays. `src/bench.cu` and the code review were done with the help of AI agents.
 
-Implemented features:
+| # | Feature | File |
+|---|---|---|
+| 1 | CPU scan, `compactWithoutScan`, `compactWithScan` (reference for every GPU test) | `cpu.cu` |
+| 2 | Naive scan, GPU Gems 39.2.1: two global buffers, one kernel per doubling | `naive.cu` |
+| 3 | Work-efficient scan + compaction (Blelloch, active tree nodes only) | `efficient.cu`, `common.cu` |
+| 4 | Thrust scan wrapper (`thrust::exclusive_scan`) | `thrust.cu` |
+| 5 | `checkCUDAError` after every CUDA call (11 sites, all outside the timed regions) | `naive/efficient/thrust.cu` |
+| 6 | [Radix sort](#extra-credit-1-radix-sort) built on the scan - extra credit 1 | `radix_sort.{h,cu}` |
+| 7 | [Shared-memory scan](#extra-credit-2-shared-memory-scan), GPU Gems 39 - extra credit 2 | `shared_scan.{h,cu}` |
 
-1. **CPU scan & compaction** (`cpu.cu`)
-   - Serial exclusive scan (reference implementation for every GPU test).
-   - `compactWithoutScan`: one pass with a running output pointer.
-   - `compactWithScan`: CPU version of map -> scan -> scatter.
-2. **Naive GPU scan** (`naive.cu`)
-   - GPU Gems 3, 39.2.1 style scan using two global-memory buffers that are
-     swapped for each doubling offset (`ilog2ceil(n)` kernel invocations).
-   - One block size for the whole grid (512, see below).
-3. **Work-efficient GPU scan & compaction** (`efficient.cu`, `common.cu`)
-   - Blelloch up-sweep / down-sweep that launches only the active tree nodes
-     (the node index comes from the level's active merge count, so no thread
-     touches a node that does not exist).
-   - **Part 5**: the upper levels are fused into one 1024-thread block that walks
-     them with `__syncthreads()` in between, cutting the launches per scan from
-     `2*log2(m)+1` to `2*log2(m/2048)+3` (45 -> 25 at `n = 2^22`, 25 -> 5 at
-     `n = 2^12`). See
-     [Part 5](#part-5-extra-credit-5-why-is-my-work-efficient-gpu-scan-slower-than-the-cpu).
-   - `Common::kernMapToBoolean` and `Common::kernScatter` add stream compaction
-     on top of the scan.
-4. **Thrust scan** (`thrust.cu`)
-   - Thin wrapper around `thrust::exclusive_scan`; device-vector setup and the
-     final copy are excluded from the measured region.
-5. **CUDA error checking** (`naive.cu`, `efficient.cu`, `thrust.cu`)
-   - Every `cudaMalloc`, `cudaMemcpy` and kernel launch is followed by
-     `checkCUDAError(...)` (11 call sites), always placed *outside* the timed
-     regions so the measured times stay comparable with the reference harness.
-6. **Radix sort on top of the scan** (extra credit 1, `radix_sort.{h,cu}`)
-   - Stable 8-bit LSD radix sort: per-block histograms, the work-efficient scan
-     for the global bucket offsets, then a warp-ranked stable scatter. Four
-     passes sort a whole 32-bit `int`, negative values included. See
-     [Extra Credit 1](#extra-credit-1-radix-sort-10).
-
-All GPU scans support **non-power-of-two** inputs: work-efficient kernels pad
-the logical array to the next power of two and only report the first `n`
-results.
+Part 5 (extra credit, see [below](#part-5-extra-credit-5-why-is-my-work-efficient-gpu-scan-slower-than-the-cpu))
+fuses the upper tree levels into one 1024-thread block, cutting the launches per
+scan from `2*log2(m)+1` to `2*log2(m/2048)+3` (45 -> 25 at `n = 2^22`, 25 -> 5 at
+`n = 2^12`). All GPU scans support **non-power-of-two** sizes by padding to the
+next power of two and only reporting the first `n` results.
 
 ## Performance Analysis
 
-All numbers below come from `src/bench.cu` (see
-[CMakeLists.txt changes](#cmakeliststxt-changes)). It drives the implementations
-through the project's own `PerformanceTimer`, so the timed region matches the
-supplied test program: kernel work only, with `cudaMalloc`/`cudaMemcpy`
-excluded. Each cell is the median of three processes, each of which takes 150
-samples (50 scans x 3 repetitions) of random values in `[0, 100)`. The harness
-also checks every variant against the CPU reference and exits non-zero on a
-mismatch.
-
-Release build (CMake + Ninja, CUDA 13.3), RTX 3060 Laptop GPU.
+`src/bench.cu` measures through the project's `PerformanceTimer`, so the timed
+region matches the supplied tests: kernel work only, `cudaMalloc`/`cudaMemcpy`
+excluded. Each cell is the median of three processes x 150 samples (50 scans x 3
+repetitions) of random values in `[0, 100)`, and every variant is checked against
+the CPU reference (see [CMakeLists.txt changes](#cmakeliststxt-changes)).
+Release build, CUDA 13.3, RTX 3060 Laptop.
 
 | n        | CPU scan (ms) | Naive scan (ms) | Work-efficient (ms) | Thrust (ms) |
 |----------|--------------:|----------------:|--------------------:|------------:|
@@ -83,11 +56,11 @@ Swept at `n = 2^22` (median of many runs):
 
 | Implementation | Sizes tried | Best | Notes |
 |---|---|---|---|
-| Naive scan | 128, 256, 512, 1024 | 512 | Memory-bound full-grid kernels; 512 balances blocks/SM with coalesced global access |
-| Work-efficient, per-level kernels | 64, 128, 256 | 64 | Deep tree levels launch very few threads; small blocks reduce launch idle work without hurting occupancy |
-| Work-efficient, Part 5 fused block | 256, 512, 1024 | 1024 | The fused block should cover as many levels as possible, so the largest legal block wins |
+| Naive scan | 128-1024 | 512 | Memory-bound full-grid kernels; 512 balances blocks/SM against coalescing |
+| Work-efficient, per-level | 64-256 | 64 | Deep levels launch few threads, so small blocks waste less |
+| Work-efficient, fused block | 256-1024 | 1024 | Only the fused block changes the launch count |
 
-Only the fused block changes the *number of kernel launches*, and that is what
+Only the fused block changes the *number of kernel launches*, which is what
 dominates at small `n`:
 
 | `FUSED_BLOCK_SIZE` | launches @ `2^12` | time @ `2^12` (ms) | launches @ `2^22` | time @ `2^22` (ms) |
@@ -96,47 +69,35 @@ dominates at small `n`:
 | 512 | 7 | 0.0328 | 27 | 1.306 |
 | 1024 | 5 | 0.0272 | 25 | 1.329 |
 
-(`50 x 3` medians; 512 was measured once, the others twice. At `2^22` all three
-agree within run-to-run noise; at `2^12` every extra launch costs ~5 us, which
-is exactly the ~0.02 ms gap between the 5-launch and 9-launch configurations.)
+At `2^22` the three agree within noise; at `2^12` every extra launch costs ~5 us,
+exactly the ~0.02 ms gap between the 5-launch and 9-launch runs.
+(`50 x 3` medians; 512 once, the others twice.)
 
 ### Observations
 
-* **The serial CPU scan wins up to about `n = 2^20`.** At `2^12` it needs
-  0.0015 ms against 0.0236 ms for the fastest GPU scan; the crossover is at
-  `2^20` (0.3634 vs 0.3793 ms, a tie), and at `2^22` the work-efficient scan is
-  1.35x and Thrust 3.3x faster. The CPU loop is one linear pass over
-  cache-friendly memory with zero setup cost, while a GPU scan pays tens of
-  microseconds of launch and issue overhead before touching a byte.
-* **The naive scan scales worst.** It is O(n log n): each of its 22 doubling
-  kernels at `2^22` sweeps the whole array (about 34 MB per kernel, ~740 MB in
-  total). It is memory-bound and the slowest implementation at 4M (2.8851 ms).
-* **The work-efficient scan moves far less data** (only the active tree nodes,
-  roughly 100 MB at `2^22`) but pays one launch per level. Part 5 removes most of
-  that overhead, so it is now the fastest hand-written scan at 4M (1.2528 ms).
-* **Thrust wins for `n >= 2^18`.** CUB scans device-wide in one kernel with a
-  decoupled look-back design (0.5180 ms at 4M, 2.4x faster than my best tree
-  scan). Below ~64K its own dispatch cost dominates (~0.03 ms regardless of
-  size), and it gets *slower* again at `2^18`-`2^20` (0.32-0.35 ms), where
-  temporary-buffer management and a multi-pass path show up.
-* **Block size is a second-order effect** (10-30%) for the naive and per-level
-  scans: they are limited by launch latency at small `n` and by memory traffic
-  at large `n`, not by per-thread work.
+* **CPU wins up to about `2^20`** (a tie there: 0.3634 vs 0.3793 ms); at `2^22`
+  the work-efficient scan is 1.35x and Thrust 3.3x faster. The CPU is one linear
+  pass over cache-friendly memory; a GPU scan pays tens of microseconds of launch
+  overhead first.
+* **Naive scales worst**: O(n log n), 22 full-array sweeps (~740 MB at `2^22`),
+  and the slowest implementation at 4M (2.8851 ms).
+* **Work-efficient moves only the active tree nodes** (~100 MB at `2^22`) but pays
+  one launch per level; after Part 5 it is the fastest hand-written scan at 4M
+  (1.2528 ms).
+* **Thrust wins from `2^18`** (0.5180 ms at 4M, one kernel with a decoupled
+  look-back); below ~64K its dispatch cost dominates (~0.03 ms) and it dips at
+  `2^18`-`2^20` (0.32-0.35 ms).
+* **Block size is a 10-30% effect** for the naive and per-level scans.
 
 ## Part 5 (extra credit, +5): why is my work-efficient GPU scan slower than the CPU?
-
-### The symptom
 
 Before Part 5 the work-efficient scan needed **0.1423 ms at `n = 2^12`** while
 the serial CPU scan needed **0.0015 ms** - about 95x slower - and it stayed
 behind the CPU until roughly `2^21` elements.
 
-### Where the time goes
-
-The harness separates the two candidate costs: `Lazy` launches the full
-`m/2`-thread grid at every level and lets the guard drop the idle threads,
-`PerLevel` launches only `ceil(active/64)` blocks per level, and `Efficient` is
-this project's fused version.
+The harness separates the two suspects: `Lazy` launches the full `m/2`-thread
+grid at every level and lets the guard drop the idle threads, `PerLevel` launches
+only `ceil(active/64)` blocks per level, and `Fused` is this project's version.
 
 | n | Lazy (ms) | Per-level (ms) | Fused (ms) |
 |---|---|---|---|
@@ -147,20 +108,16 @@ this project's fused version.
 | 1,048,576 | 0.6877 | 0.4651 | 0.3793 |
 | 4,194,304 | 2.5238 | 1.3532 | 1.2528 |
 
-1. **The number of kernel launches dominates at small `n`.** A level-by-level
-   Blelloch scan issues `2*log2(m)+1` kernels (up-sweep, one kernel that zeroes
-   the last element, down-sweep): 25 at `2^12`, 45 at `2^22`. A back-to-back
-   empty kernel launch costs **6.9 us** here (5.4 - 8.9 us across processes), so
-   25 launches at ~6 us account for essentially all of the 0.1423 ms measured at
-   `2^12`; the tree work itself is a few microseconds.
-2. **Compacting the threads alone buys nothing.** `Lazy` and `PerLevel` differ by
-   2% at `2^12` (0.1454 vs 0.1423 ms), because launching one block costs the
-   same as launching 32,768 blocks. It only matters once the launch count is
-   under control: at `2^22` the lazy grid has to *dispatch* 32,768 idle blocks
-   per level and is 1.9x slower (2.5238 vs 1.3532 ms).
+Two measurements explain it. A level-by-level Blelloch scan issues `2*log2(m)+1`
+kernels (25 at `2^12`, 45 at `2^22`) and a back-to-back empty launch costs
+**6.9 us** here (5.4 - 8.9 us), so 25 launches account for essentially all of the
+0.1423 ms measured; the tree work itself is a few microseconds. And compacting
+the threads alone buys nothing: `Lazy` and `PerLevel` agree within 2%, because
+launching one block costs the same as launching 32,768 - it only matters at
+`2^22`, where the lazy grid has to *dispatch* 32,768 idle blocks per level
+(1.9x slower, 2.5238 vs 1.3532 ms).
 
-To check the launch-overhead explanation quantitatively, compare the fused
-version with the per-level version launch by launch:
+Per-launch accounting for the fused version:
 
 | n | launches before | launches after | removed | time before (ms) | time after (ms) | speedup | implied cost per removed launch |
 |---|---|---|---|---|---|---|---|
@@ -171,22 +128,19 @@ version with the per-level version launch by launch:
 | 1,048,576 | 41 | 21 | 20 | 0.4651 | 0.3793 | 1.2x | 4.3 us |
 | 4,194,304 | 45 | 25 | 20 | 1.3532 | 1.2528 | 1.08x | 5.0 us |
 
-The last column is `(time before - time after) / 20`, and it lands near the
-measured 6.9 us at every size: the gain is exactly *removed launches x launch
-latency*, which is what you would expect if the bottleneck is kernel issue
-rather than arithmetic.
+The last column is `(time before - time after) / 20` and lands near the measured
+6.9 us at every size: the gain is exactly *removed launches x launch latency*.
 
 ### The optimization: fuse the upper tree levels into one block
 
-Once a level has at most one block of active merges it no longer needs its own
-launch - the same block loops over the remaining levels, with `__syncthreads()`
-between them to respect the tree's read-after-write dependencies.
+Once a level fits in one block it needs no launch of its own - the same block
+loops over the remaining levels, with `__syncthreads()` between them to respect
+the tree's read-after-write dependencies.
 
 ```cpp
 const int FUSED_BLOCK_SIZE = 1024;
 
-// Up-sweep of every level whose merge count is <= FUSED_BLOCK_SIZE.
-// The old offsets 1, 2, 4, ... are walked inside a single block.
+// Up-sweep of every level whose merge count fits in one block
 __global__ void kernEfficientUpSweepFused(int m, int firstOffset, int *data) {
     for (int offset = firstOffset; offset < m; offset <<= 1) {
         int active = m / (2 * offset);
@@ -198,65 +152,37 @@ __global__ void kernEfficientUpSweepFused(int m, int firstOffset, int *data) {
     }
 }
 
-// Down-sweep of the levels above `lastOffset`, in the same style.
-__global__ void kernEfficientDownSweepFused(int m, int lastOffset, int *data) {
-    for (int offset = m / 2; offset >= lastOffset; offset >>= 1) {
-        int active = m / (2 * offset);
-        if (threadIdx.x < active) {
-            int node0 = (2 * threadIdx.x + 1) * offset - 1;
-            int node1 = node0 + offset;
-            data[node1] += data[node0];
-            data[node0] = data[node1] - data[node0];
-        }
-        __syncthreads();
-    }
-}
+// Down-sweep of the levels above lastOffset, same shape: it adds the left node
+// to the right one and keeps the old left value, turning the inclusive tree into
+// an exclusive scan (kernEfficientDownSweepFused in efficient.cu).
 ```
 
-`scanDevice` splits the tree at `fusedFirst = m / (2 * FUSED_BLOCK_SIZE)` (or
-`1` if that would be zero): levels below it stay per-level launches with the
-tuned block size, and the levels above - which used to run with 1 to 1024 active
-threads - run in one block (two guards, `fusedFirst < m` and
-`fusedFirst <= m / 2`, keep the `m = 1` and `m = 2` cases correct). For
-`m <= 2048` a whole scan is three launches (up-sweep, zero the last element,
-down-sweep); for `m = 2^22` the 25 launches are 11 bulk up-sweep levels, 1 fused
-up-sweep, the zeroing, 1 fused down-sweep and 11 bulk down-sweep levels.
+`scanDevice` splits the tree at `fusedFirst = m / (2 * FUSED_BLOCK_SIZE)`: levels
+below stay per-level launches with the tuned block size, the levels above (which
+used to run with 1 - 1024 active threads) run in one block. So `m <= 2048` needs
+three launches and `2^22` needs 25: 11 bulk up-sweep, 1 fused up-sweep, the
+zeroing, 1 fused down-sweep, 11 bulk down-sweep.
 
 ![Part 5: fusion and launch counts](img/performance-part5.png)
 
-### Why the win shrinks with n
+### Limits and correctness
 
-The launches that disappear are the *cheap* ones: the bulk levels keep thousands
-of blocks of real work, and not a byte of memory traffic is removed. At `2^22`
-that overhead is ~5 us against a ~1.25 ms total, so 1.08x is all this structure
-allows; at large `n` the GPU also stays busy during the bulk phase, so
-neighbouring launches partly hide behind previous kernels. Going further means
-removing launches instead of merging them - a shared-memory tile scan with an
-offset pass (extra credit 2, below) or CUB's single-pass decoupled look-back
-(0.5180 ms at `2^22`).
+The launches that disappear are the *cheap* ones: no memory traffic is removed,
+so the ~5 us saved at `2^22` against a ~1.25 ms total is all this structure
+allows; going further means removing launches (extra credit 2 below, or CUB's
+single-pass look-back at 0.5180 ms). Integer overflow was a real trap -
+`(index + 1) * (2 * offset)` reaches `2^31` for threads without a node, and
+guarding only the store was not enough (compute-sanitizer caught the predicated
+reads), so every kernel derives `active` first and computes the index inside the
+guard. `src/bench.cu` re-checks all variants against the CPU reference, the
+supplied tests pass 12/12 (`SIZE = 256` and `1 << 20`), compute-sanitizer reports
+0 errors, and a forced failure (`CUDA_VISIBLE_DEVICES=999`) makes the new
+`checkCUDAError` print the failing call and exit with status 1.
 
-### Correctness
+## Extra Credit 1: Radix Sort
 
-* `src/bench.cu` verifies Naive, Efficient, Thrust, Lazy and PerLevel against the
-  CPU reference at every benchmarked size; the supplied scan/compaction tests
-  pass 12/12 with `SIZE = 256` and with `SIZE = 1 << 20`; compute-sanitizer
-  (memcheck) reports 0 errors over the fused *and* the pre-fusion/lazy variants.
-* Integer overflow is a real trap at the top level: `(index + 1) * (2 * offset)`
-  reaches `2^31` for threads that no longer own a node, and guarding only the
-  store was not enough in the full-grid variant - compute-sanitizer still
-  reported invalid reads because the address computation had been predicated
-  instead of branched away. Every kernel here derives
-  `active = m / (2 * offset)` first and only computes the index inside the guard.
-* With the new `checkCUDAError` calls, a forced failure
-  (`CUDA_VISIBLE_DEVICES=999`) prints
-  `CUDA error (naive.cu:49): Naive::scan: cudaMalloc / cudaMemcpy(H2D) failed: no CUDA-capable device is detected`
-  and exits with status 1 instead of silently returning garbage.
-
-## Extra Credit 1: Radix Sort (+10)
-
-`stream_compaction/radix_sort.{h,cu}` implements a **stable 8-bit LSD radix
-sort** on top of the work-efficient scan, so four counting passes sort a whole
-32-bit `int`:
+`radix_sort.{h,cu}`: a **stable 8-bit LSD radix sort** built on the work-efficient
+scan, so four counting passes sort a whole 32-bit `int`:
 
 ```cpp
 #include <stream_compaction/radix_sort.h>
@@ -268,35 +194,18 @@ StreamCompaction::RadixSort::sort(8, output, input);
 // output [ -1000  -3   0   2   5   5   7 128 ]
 ```
 
-### How it works
-
 One pass per digit, least significant byte first:
 
-1. `kernRadixHistogram` - every block builds a 256-bin histogram of its 4096
-   elements in shared memory (one warp per contiguous 512-element chunk) and
-   writes the block totals to global memory in **bin-major** layout,
-   `hist[digit * numBlocks + block]`.
-2. `Efficient::scanDevice(histPadded, devHist)` - the exclusive scan of that
-   array *is* the start offset of every (digit, block) pair: in bin-major layout
-   the prefix at `(digit, block)` counts all elements with a smaller digit plus
-   the elements of the same digit in the preceding blocks.
-3. `kernRadixScatter` - every element computes its stable rank inside its warp
-   with a warp-level shuffle ranking, adds the per-warp offset and the scanned
-   block offset, and writes itself to that position.
+1. `kernRadixHistogram` - per-block 256-bin histogram in shared memory (one warp per 512-element chunk), written bin-major as `hist[digit * numBlocks + block]`.
+2. `Efficient::scanDevice` - the exclusive scan of that array *is* the start offset of every (digit, block) pair.
+3. `kernRadixScatter` - each element adds its per-warp offset and stable warp-local rank to that base.
 
-Blocks, warps and lanes are all processed in input order, so every pass is
-stable and the four passes yield a fully sorted array. Negative values are
-handled by flipping the sign bit before the digits are extracted.
-`Efficient::scanDevice` was exposed for this so that the per-pass histogram
-scans stay in device memory; the histogram is padded to the next power of two
-(the padding is never written by the histogram kernel and never read by the
-scatter).
+Blocks, warps and lanes stay in input order, so every pass is stable and the four
+passes sort completely; negatives work by flipping the sign bit. The histogram is
+padded to the next power of two.
 
-### Performance
-
-Mixed-sign random input (every third element negated). The GPU time covers the
-four passes only; `std::sort` is sampled 5 times and the GPU sorts 20 times per
-size (median), because one `std::sort` of 4M ints already takes ~0.1 s.
+Mixed-sign random input (every third element negated); the GPU time covers the
+four passes only, `std::sort` is sampled 5 times and the GPU 20 times per size.
 
 | n | std::sort (ms) | RadixSort (ms) | thrust::sort (ms) | speedup vs std::sort |
 |---|---|---|---|---|
@@ -307,43 +216,28 @@ size (median), because one `std::sort` of 4M ints already takes ~0.1 s.
 | 1,048,576 | 28.0361 | 0.9173 | 0.7680 | 30.6x |
 | 4,194,304 | 113.5395 | 2.3994 | 1.8555 | 47.3x |
 
-(Each cell is a single-process median; repeated runs spread by about 10-30% at
-the GPU sizes below 262K elements, so the small-`n` columns are representative
-rather than exact. The radix kernels use 8 KB of shared memory and 26/40
-registers with no spills, which allows 6 blocks / 1536 threads per SM.)
-
-The small-`n` behaviour is the Part 5 story again: at `2^12` the sort issues 20
-kernel launches (4 passes x [histogram, the 3-launch scan of a 256-entry
-histogram, scatter]), about 0.12 ms of the 0.177 ms measured. From ~16K elements
-up the O(n) counting passes win, reaching 47x over `std::sort` at 4M.
-`thrust::sort` (CUB's single-pass segmented radix sort) stays 1.3x ahead because
-it needs one kernel per pass instead of a histogram / scan / scatter pipeline
-with a global round trip for the offsets. Reproduce with
+Single-process medians (10-30% spread below 262K). The kernels use 8 KB of shared
+memory and 26/40 registers with no spills (6 blocks / 1536 threads per SM). At
+`2^12` the sort issues 20 launches, ~0.12 ms of the 0.177 ms measured - the Part 5
+story again; from ~16K elements the O(n) counting passes win, reaching 47x over
+`std::sort` at 4M, while `thrust::sort` stays 1.3x ahead (one kernel per pass
+instead of histogram / scan / scatter). Reproduce with
 `stream_compaction_bench.exe --sort`.
 
-### Correctness tests
+**Tests:** 13 cases compared element by element against `std::sort` (the sorted
+sequence is unique, so duplicates are covered): 256/253, 1024 signed values,
+all-equal, sorted, reversed, `INT_MIN`/`INT_MAX` extremes, a single element, 20000
+elements with 3 distinct keys across 5 blocks, 12345 multi-block
+non-power-of-two, and `2^20` covering the whole 32-bit range. All pass,
+compute-sanitizer reports 0 errors, and a temporary fuzz harness matched
+`std::sort` on 335/335 cases (`n` in `[1, 60000]` over six distributions plus
+`n = 4095 ... 2097153`).
 
-`src/main.cpp` runs **13 cases**, each compared element by element against
-`std::sort` (the sorted sequence of an `int` array is unique, so duplicates are
-covered too): the 8-element example above; 256 values in `[0, 100)` and the same
-data truncated to 253; 1024 signed values; all-equal, already-sorted and
-reverse-sorted input; `INT_MIN` / `INT_MAX` / `0` / `-1` extremes; a single
-element; 20000 equal elements and 20000 values with 3 distinct keys (5 blocks,
-so the cross-block offsets must line up); 12345 signed values (multi-block *and*
-non-power-of-two, which exercises the histogram padding); and `2^20` values
-covering the whole 32-bit range.
+## Extra Credit 2: Shared-Memory Scan
 
-All 13 pass, compute-sanitizer reports 0 errors, and an additional temporary
-out-of-tree fuzz harness matched `std::sort` on 335/335 cases: 300 random sizes
-in `[1, 60000]` over six key distributions plus 35 cases at
-`n = 4095 ... 2097153`.
-
-## Extra Credit 2: Shared-Memory Scan (+10)
-
-`stream_compaction/shared_scan.{h,cu}` implements both block scans of GPU Gems
-chapter 39 in **dynamic shared memory**, plus the hierarchical extension for
-arrays larger than one tile. The block size is the last argument (a power of two,
-default 256):
+`shared_scan.{h,cu}`: GPU Gems chapter 39, Examples 39-1 (Hillis-Steele) and 39-2
+(Blelloch) in **dynamic shared memory**, extended hierarchically to any size. The
+block size is the last argument (a power of two, default 256):
 
 ```cpp
 #include <stream_compaction/shared_scan.h>
@@ -357,21 +251,13 @@ StreamCompaction::SharedScan::scanNaive(n, output, input, 128);       // block s
 
 Every scan is three steps:
 
-1. `kernTileScanNaive` (39-1) or `kernTileScanTree<PADDED>` (39-2): one block per
-   tile of `blockThreads` elements loads its tile into *dynamic* shared memory,
-   scans it (Hillis-Steele with register ping-pong for 39-1, Blelloch up-sweep /
-   down-sweep for 39-2), writes the exclusive result back, and records the tile
-   total in `tileSums[block]`.
-2. `Efficient::scanDevice` scans the tile totals - the chapter's "scan the sums"
-   step, which reuses the Part 5 scan.
-3. `kernAddTileOffsets` adds its tile offset to every element.
+1. Tile kernel (39-1 `kernTileScanNaive` or 39-2 `kernTileScanTree<PADDED>`): one block per tile loads its tile into dynamic shared memory, scans it, writes the exclusive result back and stores the tile total in `tileSums[block]`.
+2. `Efficient::scanDevice` scans the tile totals.
+3. `kernAddTileOffsets` adds each tile's offset to its elements.
 
-For `n = 2^22` with a block of 256 that is 11 kernel launches (tile scan, 9 for
-the tile sums, add offsets) instead of the 25 of the level-by-level tree scan.
+At `2^22` with block 256 that is 11 launches instead of 25.
 
-### Performance
-
-Medians of 20 x 3 samples, release build, same random input as the table above:
+Medians of 20 x 3 samples, same random input as above:
 
 | n | CPU | Efficient (fused, Part 5) | 39-1 shared | 39-2 shared | 39-2 padded | Thrust |
 |---|---|---|---|---|---|---|
@@ -382,71 +268,47 @@ Medians of 20 x 3 samples, release build, same random input as the table above:
 | 1,048,576 | 0.3797 | 0.4096 | **0.1341** | 0.2201 | 0.1980 | 0.3768 |
 | 4,194,304 | 1.8405 | 1.3641 | **0.4124** | 0.7200 | 0.7011 | 0.5270 |
 
-* The shared-memory scan beats the level-by-level tree scan by 3.3x at 4M and
-  also wins at the small end (0.0205 vs 0.0307 ms at `2^12`), because a tile scan
-  reaches a whole tile in one kernel instead of one kernel per tree level.
-* At 4M it is also 1.28x faster than Thrust (0.4124 vs 0.5270 ms) and 4.5x faster
-  than the serial CPU scan; the CPU still wins below ~100K elements.
-* **Hillis-Steele (39-1) beats the tree (39-2) at every size** by 1.2-1.8x. All
-  of its shared accesses are stride 1 and every thread is active at every level;
-  the tree idles half its threads per level (`active = b / (2 * offset)`) and its
-  strided node accesses cost more shared-memory transactions.
+The shared-memory scan is 3.3x faster than the fused tree scan at 4M and also wins
+at `2^12` (0.0205 vs 0.0307 ms), 1.28x faster than Thrust and 4.5x faster than the
+serial CPU scan. **39-1 beats 39-2 at every size** (1.2-1.8x): its accesses are
+all stride 1 and every thread is busy at every level, while the tree idles half
+its threads per level.
 
-### Bank conflicts, padding and occupancy
+### Bank conflicts and occupancy
 
-The chapter's tree walk visits nodes at stride `2 * offset`, so at `offset = 1`
-two threads hit the same bank (a 2-way conflict). The padded variant stores
-element `i` at `i + i / 32`, which spreads 32 consecutive elements over 32
-different banks:
+The tree walks nodes at stride `2 * offset` (a 2-way conflict at `offset = 1`); the
+padded variant stores element `i` at `i + i / 32`:
 
-| layout | isolated probe (ms) | relative |
+| layout (isolated probe: 4096 blocks x 256 threads x 200 repeats) | time (ms) | relative |
 |---|---|---|
 | Example 39-2, stride-2 accesses | 11.4166 | 1.00x |
 | Example 39-2, one pad slot per 32 elements | 12.7980 | 1.12x |
 
-The probe repeats only the access pattern of the tree phase (4096 blocks, 256
-threads, 200 repetitions), and it says the padding does *not* pay off: end to end
-it is a 3% win (0.7011 vs 0.7200 ms at 4M), and in isolation it is 12% slower,
-because the extra address arithmetic costs more than the saved transactions. This
-scan is not shared-memory-throughput bound - padding is the textbook fix for the
-conflicts, but here the real lever is the algorithm (39-1's full thread
-participation and stride-1 accesses). Nsight Compute counters would be the direct
-evidence, but GPU performance counters need administrator rights on this machine
-(`ERR_NVGPUCTRPERM`), which is why the pattern is measured directly instead.
+Padding removes the conflicts by construction but does *not* pay off here: a 3%
+win end to end (0.7011 vs 0.7200 ms at 4M) and 12% slower in the isolated probe,
+i.e. the scan is not shared-memory-throughput bound and the algorithm matters
+more. (Nsight Compute counters need administrator rights on this machine:
+`ERR_NVGPUCTRPERM`, hence the direct measurement.)
 
-Block size at `n = 2^22`. The tile lives in dynamic shared memory, so the block
-size also sets the shared memory per block, the number of tiles and the
-parallelism of the tile-sum scan:
-
-| block | 39-1 (ms) | 39-2 padded (ms) | shared bytes | tiles |
+| block @ `2^22` | 39-1 (ms) | 39-2 padded (ms) | shared bytes | tiles |
 |---|---|---|---|---|
 | 128 | 0.4124 | 0.6741 | 528 | 32768 |
 | 256 | 0.3740 | 0.7065 | 1056 | 16384 |
 | 512 | 0.4384 | 0.7820 | 2112 | 8192 |
 | 1024 | 0.5763 | 1.1729 | 4224 | 4096 |
 
-256 is the sweet spot for 39-1 and 128 for the tree. The 1024 configuration is
-1.5-1.7x slower: shared memory per block grows to 4224 B, only two 1024-thread
-blocks fit per SM, and each tile has more sequential work while the tile-sum scan
-gets fewer, larger tiles to work with - the occupancy tradeoff the assignment
-points at. The tile kernels use 12 registers (39-1) and 19 registers (39-2) with
-no spills, so registers are not the limiter.
+256 wins for 39-1 and 128 for the tree; 1024 is 1.5-1.7x slower (4224 B of shared
+memory per block, only two blocks per SM, fewer and larger tiles for the tile-sum
+scan) - the occupancy tradeoff the assignment points at. The tile kernels use 12/19
+registers with no spills.
 
-### Correctness
-
-* `src/main.cpp` runs 6 cases x 3 variants (256, 253, 33, 10000, 1 and `2^20`
-  elements, so partial tiles, non-power-of-two sizes and the single-tile case are
-  all covered) against the CPU scan: 18 checks, all passed.
-* A temporary out-of-tree sweep over 240 random sizes in `[1, 200000]` x 6 block
-  sizes (32 ... 1024) x 3 variants - 4320 scans - matched the CPU reference
-  exactly.
-* compute-sanitizer reports `ERROR SUMMARY: 0 errors` for the complete test
-  program.
-* Writing this module also found a latent bug in the Part 5 code:
-  `Efficient::scanDevice(1, devData)` used to execute `data[0] = 0` on the *host*
-  with a device pointer, which crashes. It now launches the existing one-thread
-  zeroing kernel. No caller had ever passed `m = 1` before the shared-memory scan
-  grouped a single tile.
+**Tests:** 18 checks (6 sizes x 3 variants: 256, 253, 33, 10000, 1, `2^20`, which
+covers partial tiles, non-power-of-two sizes and a single tile) against the CPU
+scan; a 4320-scan randomized sweep (240 sizes x 6 block sizes x 3 variants)
+matched the reference exactly; compute-sanitizer reports 0 errors. This module
+also exposed a latent bug: `Efficient::scanDevice(1, ...)` wrote `data[0] = 0` on
+the host with a device pointer (a crash) - it now launches the existing one-thread
+zeroing kernel.
 
 ## Test output
 
@@ -607,18 +469,13 @@ Press any key to continue . . .
 
 ## CMakeLists.txt changes
 
-The root `CMakeLists.txt` was modified beyond the `SOURCE_FILES` list:
+Both `CMakeLists.txt` files changed beyond their source lists:
 
-* The root `CMakeLists.txt` gained a second executable target,
-  `stream_compaction_bench` (`src/bench.cu`, linked against
-  `stream_compaction`). It produces every number above, verifies each variant
-  against the CPU reference, and is run with
-  `stream_compaction_bench.exe --sizes 12,14,16,18,20,22 --iters 50 --reps 3 --csv`
-  (plus `--sort` for the radix sort). Its `CUDA_ARCHITECTURES` selection and the
-  Windows-only `/Zc:preprocessor` option mirror the other targets.
-* Fixed a one-character typo in `stream_compaction/CMakeLists.txt`:
-  `set_target_properties(stream_compaction} ...)` ->
-  `set_target_properties(stream_compaction ...)`. With CMake < 3.23 that branch
-  is taken and the stray `}` makes CMake fail with "can not find target".
-* The file lists of `stream_compaction/CMakeLists.txt` also pick up the new
-  modules of extra credits 1 and 2. Nothing else changed in either file.
+* Root: added the `stream_compaction_bench` executable
+  (`src/bench.cu`), with the same version-guarded `CUDA_ARCHITECTURES` and
+  Windows-only `/Zc:preprocessor` as the other targets. Modes:
+  `--sizes 12,14,16,18,20,22 --iters 50 --reps 3 --csv` (scans), `--sort` (radix
+  sort), `--smem` (shared-memory scan).
+* `stream_compaction/CMakeLists.txt`: fixed a stray `}` in
+  `set_target_properties(stream_compaction} ...)` that breaks CMake < 3.23, and
+  added the extra-credit modules to the file lists. Nothing else changed.

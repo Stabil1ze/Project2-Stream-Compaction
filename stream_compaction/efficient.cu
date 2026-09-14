@@ -58,10 +58,7 @@ namespace StreamCompaction {
                 data[m - 1] = 0;
             }
         }
-        // The levels whose active merge count is at most FUSED_BLOCK_SIZE are
-        // fused into a single 1024-thread block: several tree levels are walked
-        // with __syncthreads() between them instead of paying one kernel launch
-        // per level (Part 5).
+
         __global__ void kernEfficientUpSweepFused(int m, int firstOffset, int *data) {
             for (int offset = firstOffset; offset < m; offset <<= 1) {
                 int active = m / (2 * offset);
@@ -86,25 +83,16 @@ namespace StreamCompaction {
             }
         }
 
-        // Runs the work-efficient exclusive scan in place on a device array.
-        // m must be a power of two and every element past the logical length
-        // must already be zero. Exposed so that GPU modules built on top of the
-        // scan (see radix_sort.cu) can chain scans without a host round trip.
+        // Runs the work-efficient exclusive scan in place on a device array
         void scanDevice(int m, int *data) {
             if (m <= 0) {
                 return;
             }
             if (m == 1) {
-                // The one-element exclusive scan is a zero, but data lives in
-                // device memory: writing it from the host would fault, so the
-                // existing "zero the last element" kernel does it instead.
                 kernEfficientSetLastZero<<<1, 1>>>(m, data);
                 return;
             }
 
-            // Top levels (active merges <= FUSED_BLOCK_SIZE) run in one block.
-            // For m = 2^22 this turns 11 launches per phase into one; below
-            // m = 2048 the whole scan fits into three launches.
             const int fusedFirst = (m > 2 * FUSED_BLOCK_SIZE) ? (m / (2 * FUSED_BLOCK_SIZE)) : 1;
 
             for (int offset = 1; offset < fusedFirst; offset <<= 1) {

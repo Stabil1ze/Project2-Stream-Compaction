@@ -1,19 +1,3 @@
-/**
- * @file      radix_sort.cu
- * @brief     GPU radix sort for the stream compaction module (extra credit 1).
- *
- * One counting pass per 8-bit digit, least significant digit first:
- *   1. kernRadixHistogram builds a per-block digit histogram in global memory,
- *      in bin-major layout (hist[digit * numBlocks + block]).
- *   2. The project's work-efficient scan (Efficient::scanDevice) turns that
- *      histogram into the global start offset of every (digit, block) pair.
- *      In bin-major layout the exclusive prefix sum at (digit, block) is
- *      exactly "all elements with a smaller digit, plus the elements of this
- *      digit in the preceding blocks".
- *   3. kernRadixScatter computes each element's stable rank inside its block
- *      (warp-level shuffle ranking) and writes it to base + rank.
- */
-
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include "common.h"
@@ -49,23 +33,13 @@ namespace StreamCompaction {
             }
         }  // namespace
 
-        /**
-         * Digit of `value` for the pass starting at bit `shift`. The sign bit is
-         * flipped first so that the unsigned digit order equals the order of the
-         * signed ints, which is what makes the sort work for negative values.
-         */
+        // Digit of value for the pass starting at bit `shift`. 
         __device__ __forceinline__ int radixDigit(int value, int shift) {
             unsigned key = static_cast<unsigned>(value) ^ 0x80000000u;
             return static_cast<int>((key >> shift) & (RADIX - 1));
         }
 
-        /**
-         * Stable rank of `digit` within the calling warp: how many lanes with a
-         * smaller lane index carry the same digit (rank), and how many lanes
-         * carry it at all (count). A shuffle loop is used instead of
-         * __match_any_sync so that the code also compiles for compute
-         * capability < 7.0.
-         */
+        // Stable rank of digit within the calling warp
         __device__ __forceinline__ void warpStableRank(int digit, int lane, int &rank, int &count) {
             rank = 0;
             count = 0;
@@ -79,12 +53,7 @@ namespace StreamCompaction {
             }
         }
 
-        /**
-         * Counts the digit histogram of this warp's chunk of the block into
-         * warpCount[warp * RADIX .. warp * RADIX + RADIX - 1] (shared memory).
-         * Each warp owns a contiguous chunk, so the per-warp counts can be
-         * turned into per-warp offsets without losing the input order.
-         */
+        // Counts the digit histogram of this warp's chunk of the block into shared memory
         __device__ __forceinline__ void countWarpChunk(int n, int shift, const int *idata, int *warpCount) {
             const int warp = threadIdx.x >> WARP_LOG2;
             const int lane = threadIdx.x & (WARP_SIZE - 1);
@@ -108,10 +77,6 @@ namespace StreamCompaction {
             __syncthreads();
         }
 
-        /**
-         * 256-bin digit histogram of every block, stored bin-major so that a
-         * single exclusive scan of the array yields all global start offsets.
-         */
         __global__ void kernRadixHistogram(int n, int shift, int numBlocks, const int *idata, int *hist) {
             __shared__ int warpCount[WARPS_PER_BLOCK * RADIX];
             countWarpChunk(n, shift, idata, warpCount);
@@ -127,11 +92,7 @@ namespace StreamCompaction {
             }
         }
 
-        /**
-         * Stable scatter: every element goes to
-         * hist[digit * numBlocks + block] + (offsets of the preceding warps of
-         * this block) + (stable rank inside its warp).
-         */
+        // Stable scatter
         __global__ void kernRadixScatter(int n, int shift, int numBlocks, const int *idata,
                                          int *odata, const int *hist) {
             __shared__ int warpCount[WARPS_PER_BLOCK * RADIX];
@@ -140,8 +101,7 @@ namespace StreamCompaction {
 
             countWarpChunk(n, shift, idata, warpCount);
 
-            // Reuse the same counts as the exclusive offset of each warp, so
-            // that a warp's elements follow the previous warps' elements.
+            // Reuse the same counts as the exclusive offset of each warp
             for (int d = threadIdx.x; d < RADIX; d += BLOCK_THREADS) {
                 int running = 0;
                 for (int w = 0; w < WARPS_PER_BLOCK; ++w) {
@@ -159,9 +119,6 @@ namespace StreamCompaction {
             for (int t = 0; t < tiles; ++t) {
                 const int i = chunkStart + t * WARP_SIZE + lane;
                 const bool active = i < chunkEnd;
-                // Lanes without an element carry a digit that no bucket can have
-                // (RADIX), so they never match a real lane in the ranking below
-                // and the guarded store keeps every array index in range.
                 const int digit = active ? radixDigit(idata[i], shift) : RADIX;
 
                 int rank = 0;
@@ -197,9 +154,7 @@ namespace StreamCompaction {
             cudaMalloc(reinterpret_cast<void **>(&devHist), histPadded * sizeof(int));
             cudaMemcpy(devA, idata, n * sizeof(int), cudaMemcpyHostToDevice);
             if (histSize < histPadded) {
-                // The scan treats the histogram as a power-of-two array. Only
-                // the padding has to be zeroed: the histogram kernel rewrites
-                // every entry below histSize on every pass.
+                // The scan treats the histogram as a power-of-two array
                 cudaMemset(devHist + histSize, 0, (histPadded - histSize) * sizeof(int));
             }
             checkCUDAError("RadixSort::sort: cudaMalloc / cudaMemcpy(H2D) / cudaMemset failed");
@@ -213,8 +168,7 @@ namespace StreamCompaction {
 
                 kernRadixHistogram<<<numBlocks, BLOCK_THREADS>>>(n, shift, numBlocks, src, devHist);
 
-                // Exclusive scan of the bin-major histogram: one of the scan
-                // implementations of this project, run in place in device memory.
+                // Exclusive scan of the bin-major histogram
                 StreamCompaction::Efficient::scanDevice(histPadded, devHist);
 
                 kernRadixScatter<<<numBlocks, BLOCK_THREADS>>>(n, shift, numBlocks, src, dst, devHist);
