@@ -21,14 +21,14 @@ rays. `src/bench.cu` and the code review were done with the help of AI agents.
 | 3 | Work-efficient scan + compaction (Blelloch, active tree nodes only) | `efficient.cu`, `common.cu` |
 | 4 | Thrust scan wrapper (`thrust::exclusive_scan`) | `thrust.cu` |
 | 5 | `checkCUDAError` after every CUDA call (11 sites, all outside the timed regions) | `naive/efficient/thrust.cu` |
-| 6 | [Radix sort](#extra-credit-1-radix-sort) built on the scan - extra credit 1 | `radix_sort.{h,cu}` |
-| 7 | [Shared-memory scan](#extra-credit-2-shared-memory-scan), GPU Gems 39 - extra credit 2 | `shared_scan.{h,cu}` |
+| 6 | [Radix sort](#radix-sort) built on the scan - extra credit 1 | `radix_sort.{h,cu}` |
+| 7 | [Shared-memory scan](#shared-memory-scan), GPU Gems 39 - extra credit 2 | `shared_scan.{h,cu}` |
 
-Part 5 (extra credit, see [below](#part-5-extra-credit-5-why-is-my-work-efficient-gpu-scan-slower-than-the-cpu))
-fuses the upper tree levels into one 1024-thread block, cutting the launches per
-scan from `2*log2(m)+1` to `2*log2(m/2048)+3` (45 -> 25 at `n = 2^22`, 25 -> 5 at
-`n = 2^12`). All GPU scans support **non-power-of-two** sizes by padding to the
-next power of two and only reporting the first `n` results.
+[Part 5](#part-5) fuses the upper tree levels into one 1024-thread block, cutting
+the launches per scan from `2*log2(m)+1` to `2*log2(m/2048)+3` (45 -> 25 at
+`n = 2^22`, 25 -> 5 at `n = 2^12`). All GPU scans support **non-power-of-two**
+sizes by padding to the next power of two and only reporting the first `n`
+results.
 
 ## Performance Analysis
 
@@ -89,7 +89,7 @@ exactly the ~0.02 ms gap between the 5-launch and 9-launch runs.
   `2^18`-`2^20` (0.32-0.35 ms).
 * **Block size is a 10-30% effect** for the naive and per-level scans.
 
-## Part 5 (extra credit, +5): why is my work-efficient GPU scan slower than the CPU?
+## Part 5
 
 Before Part 5 the work-efficient scan needed **0.1423 ms at `n = 2^12`** while
 the serial CPU scan needed **0.0015 ms** - about 95x slower - and it stayed
@@ -169,7 +169,7 @@ zeroing, 1 fused down-sweep, 11 bulk down-sweep.
 
 The launches that disappear are the *cheap* ones: no memory traffic is removed,
 so the ~5 us saved at `2^22` against a ~1.25 ms total is all this structure
-allows; going further means removing launches (extra credit 2 below, or CUB's
+allows; going further means removing launches (the shared-memory scan below, or CUB's
 single-pass look-back at 0.5180 ms). Integer overflow was a real trap -
 `(index + 1) * (2 * offset)` reaches `2^31` for threads without a node, and
 guarding only the store was not enough (compute-sanitizer caught the predicated
@@ -179,7 +179,7 @@ supplied tests pass 12/12 (`SIZE = 256` and `1 << 20`), compute-sanitizer report
 0 errors, and a forced failure (`CUDA_VISIBLE_DEVICES=999`) makes the new
 `checkCUDAError` print the failing call and exit with status 1.
 
-## Extra Credit 1: Radix Sort
+## Radix Sort
 
 `radix_sort.{h,cu}`: a **stable 8-bit LSD radix sort** built on the work-efficient
 scan, so four counting passes sort a whole 32-bit `int`:
@@ -233,7 +233,7 @@ compute-sanitizer reports 0 errors, and a temporary fuzz harness matched
 `std::sort` on 335/335 cases (`n` in `[1, 60000]` over six distributions plus
 `n = 4095 ... 2097153`).
 
-## Extra Credit 2: Shared-Memory Scan
+## Shared-Memory Scan
 
 `shared_scan.{h,cu}`: GPU Gems chapter 39, Examples 39-1 (Hillis-Steele) and 39-2
 (Blelloch) in **dynamic shared memory**, extended hierarchically to any size. The
